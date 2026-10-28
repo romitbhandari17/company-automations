@@ -6,8 +6,12 @@ to `Candidates List.xlsx`.
 - Safe to re-run anytime: resumes already recorded (tracked by filename in the
   hidden "Source File" column, and backed up by an Email dedupe check) are
   skipped automatically.
-- Extracts: Name, Total Exp, Cloud Exp., Tech, Current CTC, Company, Mobile,
-  Email, Linked-in.
+- Extracts: Name, Total Exp, Cloud Exp., Tech, Current CTC, Company, College,
+  Passout Year, Mobile, Email, Linked-in.
+- Candidates whose College info shows a 2027 or 2028 passout year are flagged
+  in the "Join Readiness" column (they're still studying and can't join
+  immediately). This also backfills existing rows that already have a
+  College value on each run.
 - Email / Mobile / LinkedIn are extracted deterministically (regex + PDF
   hyperlink annotations).
 - Name / Total Exp / Cloud Exp. / Tech / Current CTC / Company are extracted
@@ -40,7 +44,13 @@ SHEET_NAME = "Sheet1"
 HEADERS = [
     "Name", "Total Exp", "Cloud Exp.", "Tech", "Current CTC", "Company",
     "College", "Mobile", "Email", "Linked-in", "Source File", "Processed At",
+    "Passout Year", "Join Readiness",
 ]
+
+# Candidates still finishing college in these years are typically unable to
+# join immediately, so they get flagged for recruiter attention.
+NOT_READY_PASSOUT_YEARS = {2027, 2028}
+NOT_READY_FLAG_TEMPLATE = "Not ready to join - passing out in {year}"
 
 CLOUD_KEYWORDS = [
     "aws", "amazon web services", "gcp", "google cloud", "azure",
@@ -198,6 +208,12 @@ COLLEGE_KEYWORDS_RE = re.compile(
     r"polytechnic|school of engineering|institute)\b",
     re.IGNORECASE,
 )
+YEAR_RANGE_RE = re.compile(r"(20\d{2})\s*[-–—to]+\s*(20\d{2})")
+EXPECTED_YEAR_RE = re.compile(
+    r"(?:expected|expected\s*graduation|graduat\w*|batch\s*of|passing\s*out)"
+    r"\D{0,15}(20\d{2})",
+    re.IGNORECASE,
+)
 ROLE_KEYWORDS = (
     "engineer", "developer", "intern", "sde", "scientist", "analyst",
     "manager", "consultant", "architect", "lead", "specialist", "designer",
@@ -248,6 +264,34 @@ def guess_college(text):
         if line and COLLEGE_KEYWORDS_RE.search(line):
             # Strip a trailing date range if present on the same line.
             return DATE_RANGE_RE.sub("", line).strip(" -|\t•·,")
+    return ""
+
+
+def extract_passout_year(text):
+    """Pull a graduation/passout year out of a chunk of education text, e.g.
+    "Chandigarh University 2023 - 2027" or "Expected Graduation: 2027"."""
+    if not text:
+        return None
+    match = EXPECTED_YEAR_RE.search(text)
+    if match:
+        return int(match.group(1))
+    match = YEAR_RANGE_RE.search(text)
+    if match:
+        return int(match.group(2))
+    return None
+
+
+def guess_passout_year(text):
+    lines = restrict_to_education_section(text.splitlines())
+    edu_text = "\n".join(lines) if lines else text
+    return extract_passout_year(edu_text)
+
+
+def join_readiness_flag(passout_year):
+    """Flag candidates who are still studying and won't be able to join
+    immediately (batches of 2027/2028)."""
+    if passout_year in NOT_READY_PASSOUT_YEARS:
+        return NOT_READY_FLAG_TEMPLATE.format(year=passout_year)
     return ""
 
 
@@ -324,6 +368,7 @@ def heuristic_extract(text):
         "current_ctc": current_ctc,
         "company": company,
         "college": guess_college(text),
+        "passout_year": guess_passout_year(text),
     }
 
 
@@ -352,7 +397,11 @@ def ai_extract(text):
         "company (string, most recent/current employer, empty if none, "
         "e.g. for students/freshers), "
         "college (string, name of the university/college/institute from the "
-        "Education section, empty if none).\n\n"
+        "Education section, empty if none), "
+        "passout_year (number, the candidate's graduation/passout year from "
+        "the Education section, e.g. the end year of a degree date range or "
+        "an expected graduation year; null if unknown or already graduated "
+        "with no year mentioned).\n\n"
         f"Resume text:\n{text[:8000]}"
     )
     try:
@@ -385,20 +434,27 @@ def load_sheet():
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
 
     header_row = [cell.value for cell in ws[1]]
-    for col_idx, col_name in enumerate(HEADERS, start=1):
-        existing = header_row[col_idx - 1] if col_idx <= len(header_row) else None
-        if existing == col_name:
+    for col_name in HEADERS:
+        if col_name in header_row:
             continue
-        if col_name not in header_row:
-            # New column expected by the script (e.g. "College") that the
-            # sheet doesn't have yet: insert it at the right position so
-            # existing row data doesn't get misaligned/overwritten.
-            ws.insert_cols(col_idx)
-            ws.cell(row=1, column=col_idx, value=col_name)
-            header_row.insert(col_idx - 1, col_name)
-        else:
-            ws.cell(row=1, column=col_idx, value=col_name)
+        # New column expected by the script (e.g. "Passout Year") that the
+        # sheet doesn't have yet: append it after the last column instead of
+        # inserting in the middle. insert_cols() can corrupt/duplicate data
+        # in sparsely-populated rows, so appending is the safe option; the
+        # script always looks up columns by header name, not fixed position.
+        new_col_idx = ws.max_column + 1
+        ws.cell(row=1, column=new_col_idx, value=col_name)
+        header_row.append(col_name)
     return wb, ws
+
+
+def column_index_map(ws):
+    """Map header name -> 1-based column index, from the sheet's header row."""
+    return {
+        cell.value: idx
+        for idx, cell in enumerate(ws[1], start=1)
+        if cell.value
+    }
 
 
 def get_known_keys(ws):
@@ -435,6 +491,39 @@ def next_empty_row(ws):
     return row
 
 
+def backfill_join_readiness(ws):
+    """Fill in Passout Year / Join Readiness for rows already in the sheet
+    (e.g. candidates added before these columns existed) by re-deriving the
+    passout year from their stored College text."""
+    header = [cell.value for cell in ws[1]]
+    try:
+        name_col = header.index("Name") + 1
+        college_col = header.index("College") + 1
+        passout_col = header.index("Passout Year") + 1
+        readiness_col = header.index("Join Readiness") + 1
+    except ValueError:
+        return 0
+
+    updated = 0
+    for row in ws.iter_rows(min_row=2):
+        if not row[name_col - 1].value:
+            continue
+        if row[readiness_col - 1].value:
+            continue  # already flagged/filled, don't overwrite.
+        college_text = row[college_col - 1].value
+        if not college_text:
+            continue
+        passout_year = extract_passout_year(str(college_text))
+        flag = join_readiness_flag(passout_year)
+        if not flag:
+            continue
+        if not row[passout_col - 1].value:
+            row[passout_col - 1].value = passout_year
+        row[readiness_col - 1].value = flag
+        updated += 1
+    return updated
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -458,6 +547,7 @@ def process_file(path: Path):
         current_ctc = ai_data.get("current_ctc") or ""
         company = ai_data.get("company") or ""
         college = ai_data.get("college") or guess_college(text)
+        passout_year = ai_data.get("passout_year") or guess_passout_year(text)
     else:
         h = heuristic_extract(text)
         name = h["name"]
@@ -467,6 +557,7 @@ def process_file(path: Path):
         current_ctc = h["current_ctc"]
         company = h["company"]
         college = h["college"]
+        passout_year = h["passout_year"]
 
     return {
         "Name": name,
@@ -476,6 +567,8 @@ def process_file(path: Path):
         "Current CTC": current_ctc,
         "Company": company,
         "College": college,
+        "Passout Year": passout_year,
+        "Join Readiness": join_readiness_flag(passout_year),
         "Mobile": mobile,
         "Email": email,
         "Linked-in": linkedin,
@@ -490,7 +583,9 @@ def main():
         sys.exit(1)
 
     wb, ws = load_sheet()
+    backfilled_count = backfill_join_readiness(ws)
     known_files, known_emails, known_names_without_email = get_known_keys(ws)
+    col_map = column_index_map(ws)
 
     resume_files = sorted(
         p for p in RESUME_DIR.iterdir()
@@ -525,8 +620,10 @@ def main():
             known_files.add(path.name)
             continue
 
-        for col_idx, col_name in enumerate(HEADERS, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=record.get(col_name))
+        for col_name, value in record.items():
+            col_idx = col_map.get(col_name)
+            if col_idx:
+                ws.cell(row=row_idx, column=col_idx, value=value)
 
         if email_key:
             known_emails.add(email_key)
@@ -539,6 +636,11 @@ def main():
     if new_count:
         wb.save(SHEET_PATH)
         print(f"\nSaved {new_count} new candidate(s) to {SHEET_PATH.name}")
+        if backfilled_count:
+            print(f"Also flagged {backfilled_count} existing candidate(s) for join readiness.")
+    elif backfilled_count:
+        wb.save(SHEET_PATH)
+        print(f"\nFlagged {backfilled_count} existing candidate(s) for join readiness.")
     else:
         print("\nNo new resumes to add. Everything is already up to date.")
 
